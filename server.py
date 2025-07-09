@@ -33,23 +33,45 @@ def make_gitlab_api_request(ctx: Context, endpoint: str, method: str = "GET", da
         raise ValueError("GitLab token not set. Please set GITLAB_TOKEN in your environment.")
     
     url = f"https://{gitlab_ctx.host}/api/{gitlab_ctx.api_version}/{endpoint}"
+    
+    # FIX: Use Bearer token format instead of Private-Token
     headers = {
         'Accept': 'application/json',
+        'Content-Type': 'application/json',
         'User-Agent': 'GitLabMCPCodeReview/1.0',
-        'Private-Token': gitlab_ctx.token
+        'Authorization': f'Bearer {gitlab_ctx.token}'  # Changed from Private-Token
     }
+    
+    # Log the request for debugging
+    logger.info(f"Making {method} request to: {url}")
+    if data:
+        logger.debug(f"Request data: {json.dumps(data, indent=2)}")
     
     try:
         if method.upper() == "GET":
-            response = requests.get(url, headers=headers, verify=True)
+            response = requests.get(url, headers=headers, verify=True, timeout=30)
         elif method.upper() == "POST":
-            response = requests.post(url, headers=headers, json=data, verify=True)
+            response = requests.post(url, headers=headers, json=data, verify=True, timeout=30)
+        elif method.upper() == "PUT":
+            response = requests.put(url, headers=headers, json=data, verify=True, timeout=30)
+        elif method.upper() == "DELETE":
+            response = requests.delete(url, headers=headers, verify=True, timeout=30)
         else:
             raise ValueError(f"Unsupported HTTP method: {method}")
+        
+        # Enhanced error handling
+        logger.info(f"Response status: {response.status_code}")
         
         if response.status_code == 401:
             logger.error("Authentication failed. Check your GitLab token.")
             raise Exception("Authentication failed. Please check your GitLab token.")
+        elif response.status_code == 403:
+            logger.error(f"Access forbidden. Check your permissions for: {endpoint}")
+            logger.error(f"Response: {response.text}")
+            raise Exception(f"Access forbidden. You may not have permission to access this resource: {endpoint}")
+        elif response.status_code == 404:
+            logger.error(f"Resource not found: {endpoint}")
+            raise Exception(f"Resource not found: {endpoint}")
             
         response.raise_for_status()
         
@@ -57,15 +79,22 @@ def make_gitlab_api_request(ctx: Context, endpoint: str, method: str = "GET", da
             return {}
             
         try:
-            return response.json()
+            result = response.json()
+            logger.debug(f"Response: {json.dumps(result, indent=2)}")
+            return result
         except json.JSONDecodeError as e:
             logger.error(f"Failed to parse JSON response: {str(e)}")
+            logger.error(f"Raw response: {response.text}")
             raise Exception(f"Failed to parse GitLab response as JSON: {str(e)}")
             
+    except requests.exceptions.Timeout:
+        logger.error("Request timed out")
+        raise Exception("Request timed out. GitLab server may be slow.")
     except requests.exceptions.RequestException as e:
         logger.error(f"REST request failed: {str(e)}")
-        if hasattr(e, 'response'):
+        if hasattr(e, 'response') and e.response is not None:
             logger.error(f"Response status: {e.response.status_code}")
+            logger.error(f"Response text: {e.response.text}")
         raise Exception(f"Failed to make GitLab API request: {str(e)}")
 
 @asynccontextmanager
@@ -81,7 +110,10 @@ async def gitlab_lifespan(server: FastMCP) -> AsyncIterator[GitLabContext]:
             "Please set this in your environment or .env file."
         )
     
+    # Test the token on startup
     ctx = GitLabContext(host=host, token=token)
+    logger.info(f"Initialized GitLab context for host: {host}")
+    
     try:
         yield ctx
     finally:
@@ -94,6 +126,33 @@ mcp = FastMCP(
     lifespan=gitlab_lifespan,
     dependencies=["python-dotenv", "requests"]
 )
+
+@mcp.tool()
+def test_gitlab_connection(ctx: Context) -> Dict[str, Any]:
+    """
+    Test the GitLab API connection and token permissions.
+    
+    Returns:
+        Dict containing connection test results
+    """
+    try:
+        # Test basic API access
+        user_info = make_gitlab_api_request(ctx, "user")
+        
+        return {
+            "status": "success",
+            "message": "GitLab connection successful",
+            "user": {
+                "id": user_info.get("id"),
+                "username": user_info.get("username"),
+                "name": user_info.get("name")
+            }
+        }
+    except Exception as e:
+        return {
+            "status": "error",
+            "message": f"GitLab connection failed: {str(e)}"
+        }
 
 @mcp.tool()
 def fetch_merge_request(ctx: Context, project_id: str, merge_request_iid: str) -> Dict[str, Any]:
@@ -117,19 +176,9 @@ def fetch_merge_request(ctx: Context, project_id: str, merge_request_iid: str) -
     changes_endpoint = f"{mr_endpoint}/changes"
     changes_info = make_gitlab_api_request(ctx, changes_endpoint)
     
-    # Get the commit information
-    commits_endpoint = f"{mr_endpoint}/commits"
-    commits_info = make_gitlab_api_request(ctx, commits_endpoint)
-    
-    # Get the notes (comments) for this merge request
-    notes_endpoint = f"{mr_endpoint}/notes"
-    notes_info = make_gitlab_api_request(ctx, notes_endpoint)
-    
     return {
         "merge_request": mr_info,
-        "changes": changes_info,
-        "commits": commits_info,
-        "notes": notes_info
+        "changes": changes_info
     }
 
 @mcp.tool()
@@ -233,6 +282,8 @@ def add_merge_request_comment(ctx: Context, project_id: str, merge_request_iid: 
     Returns:
         Dict containing the created comment information
     """
+    logger.info(f"Adding comment to MR {merge_request_iid} in project {project_id}")
+    
     # Create the comment data
     data = {
         "body": body
@@ -244,12 +295,35 @@ def add_merge_request_comment(ctx: Context, project_id: str, merge_request_iid: 
     
     # Add the comment
     comment_endpoint = f"projects/{quote(project_id, safe='')}/merge_requests/{merge_request_iid}/notes"
-    comment_info = make_gitlab_api_request(ctx, comment_endpoint, method="POST", data=data)
     
-    if not comment_info:
-        raise ValueError("Failed to add comment to merge request")
+    try:
+        comment_info = make_gitlab_api_request(ctx, comment_endpoint, method="POST", data=data)
+        
+        if not comment_info:
+            raise ValueError("Failed to add comment to merge request")
+        
+        logger.info(f"Successfully added comment with ID: {comment_info.get('id')}")
+        return comment_info
+        
+    except Exception as e:
+        logger.error(f"Failed to add comment: {str(e)}")
+        raise
+
+@mcp.tool()
+def get_merge_request_notes(ctx: Context, project_id: str, merge_request_iid: str) -> List[Dict[str, Any]]:
+    """
+    Get all notes/comments for a merge request.
     
-    return comment_info
+    Args:
+        project_id: The GitLab project ID or URL-encoded path
+        merge_request_iid: The merge request IID (project-specific ID)
+    Returns:
+        List of note objects
+    """
+    notes_endpoint = f"projects/{quote(project_id, safe='')}/merge_requests/{merge_request_iid}/notes"
+    notes_info = make_gitlab_api_request(ctx, notes_endpoint)
+    
+    return notes_info
 
 @mcp.tool()
 def approve_merge_request(ctx: Context, project_id: str, merge_request_iid: str, approvals_required: Optional[int] = None) -> Dict[str, Any]:
@@ -319,4 +393,4 @@ if __name__ == "__main__":
         mcp.run(transport='stdio')
     except Exception as e:
         logger.error(f"Failed to start MCP server: {str(e)}")
-        raise 
+        raise
