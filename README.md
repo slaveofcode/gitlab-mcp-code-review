@@ -14,6 +14,11 @@ An MCP (Model Context Protocol) server for integrating AI assistants like Claude
 - **Version Comparison**: Compare different branches, tags, or commits
 - **Review Management**: Add comments, approve, or unapprove merge requests
 - **Project Overview**: Get lists of all merge requests in a project
+- **🆕 Approval Analytics**: Comprehensive approval tracking and statistics
+  - Track user approvals across projects and timeframes
+  - Generate approval statistics and trends by project
+  - Multi-project approval summaries for individual users
+  - Monthly approval trend analysis with historical data
 
 ## Installation
 
@@ -135,52 +140,121 @@ Replace `/path/to/your/gitlab-mcp-code-review` with the actual path to your clon
 
 The MCP server provides the following tools for interacting with GitLab:
 
+### Core Merge Request Tools
+
 | Tool | Description |
 |------|-------------|
+| `test_gitlab_connection` | Test the GitLab API connection and token permissions |
 | `fetch_merge_request` | Get complete information about a merge request |
 | `fetch_merge_request_diff` | Get diffs for a specific merge request |
 | `fetch_commit_diff` | Get diff information for a specific commit |
 | `compare_versions` | Compare different branches, tags, or commits |
 | `add_merge_request_comment` | Add a comment to a merge request |
+| `get_merge_request_notes` | Get all notes/comments for a merge request |
 | `approve_merge_request` | Approve a merge request |
 | `unapprove_merge_request` | Unapprove a merge request |
 | `get_project_merge_requests` | Get a list of merge requests for a project |
 
+### 🆕 Approval Analytics Tools
+
+| Tool | Description |
+|------|-------------|
+| `get_user_approved_merge_requests` | Get merge requests approved by a specific user within a timeframe |
+| `get_project_approval_statistics` | Get aggregated approval statistics for a project within a timeframe |
+| `get_user_approval_summary` | Get a comprehensive approval summary for a user across multiple projects |
+| `get_monthly_approval_trends` | Get monthly approval trends for a project or specific user |
+
 ## Usage Examples
 
-### Fetch a Merge Request
+### Core Merge Request Operations
+
+#### Fetch a Merge Request
 
 ```python
 # Get details of merge request #5 in project with ID 123
 mr = fetch_merge_request("123", "5")
 ```
 
-### View Specific File Changes
+#### View Specific File Changes
 
 ```python
 # Get diff for a specific file in a merge request
 file_diff = fetch_merge_request_diff("123", "5", "path/to/file.js")
 ```
 
-### Compare Branches
+#### Compare Branches
 
 ```python
 # Compare develop branch with master branch
 diff = compare_versions("123", "develop", "master")
 ```
 
-### Add a Comment to a Merge Request
+#### Add a Comment to a Merge Request
 
 ```python
 # Add a comment to a merge request
 comment = add_merge_request_comment("123", "5", "This code looks good!")
 ```
 
-### Approve a Merge Request
+#### Approve a Merge Request
 
 ```python
 # Approve a merge request and set required approvals to 2
 approval = approve_merge_request("123", "5", approvals_required=2)
+```
+
+### 🆕 Approval Analytics Examples
+
+#### Get User's Approved MRs in a Timeframe
+
+```python
+# Get merge requests approved by user "john.doe" in the last 30 days
+user_approvals = get_user_approved_merge_requests(
+    project_id="123",
+    username="john.doe",
+    created_after="2024-01-01",
+    created_before="2024-01-31",
+    state="merged"
+)
+```
+
+#### Project Approval Statistics
+
+```python
+# Get approval statistics for a project in the last quarter
+project_stats = get_project_approval_statistics(
+    project_id="123",
+    created_after="2024-01-01",
+    created_before="2024-03-31"
+)
+```
+
+#### User Approval Summary Across Projects
+
+```python
+# Get comprehensive approval summary for a user across all their projects
+user_summary = get_user_approval_summary(
+    username="jane.smith",
+    created_after="2024-01-01",
+    project_ids=["123", "456", "789"]  # Optional: specify projects
+)
+```
+
+#### Monthly Approval Trends
+
+```python
+# Get monthly approval trends for a project over the last 6 months
+monthly_trends = get_monthly_approval_trends(
+    project_id="123",
+    months_back=6
+)
+
+# Get monthly approval trends for a specific user
+user_trends = get_monthly_approval_trends(
+    project_id="123",
+    username="john.doe",
+    months_back=12
+)
 ```
 
 ## Troubleshooting
