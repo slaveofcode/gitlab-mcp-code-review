@@ -878,6 +878,9 @@ def get_user_approvals_across_group(
     Returns:
         Dict containing approved merge requests across all projects in the group
     """
+    import concurrent.futures
+    from concurrent.futures import ThreadPoolExecutor
+    
     # First, get the user info if username is provided instead of user_id
     target_user_id = user_id
     if not target_user_id and username:
@@ -891,67 +894,313 @@ def get_user_approvals_across_group(
         raise ValueError("Either user_id or username must be provided")
     
     # Get all projects in the group
-    projects = get_group_projects(ctx, group_id)
+    projects_endpoint = f"groups/{quote(group_id, safe='')}/projects?per_page=100"
+    projects = make_gitlab_api_request(ctx, projects_endpoint)
     
-    group_summary = {
+    def check_project_approvals(project):
+        try:
+            result = get_user_approved_merge_requests(
+                ctx, 
+                str(project["id"]), 
+                target_user_id, 
+                None,  # username not needed since we have user_id
+                created_after, 
+                created_before, 
+                state, 
+                limit_per_project
+            )
+            
+            if result["total_approvals"] > 0:
+                return {
+                    "project_id": str(project["id"]),
+                    "project_name": project["name"],
+                    "project_path": project["path_with_namespace"],
+                    "project_web_url": project["web_url"],
+                    "total_approvals": result["total_approvals"],
+                    "approved_mrs": result["approved_merge_requests"]
+                }
+            return None
+        except Exception as e:
+            # Skip projects with errors (e.g., no access)
+            return None
+    
+    # Use ThreadPoolExecutor for parallel processing
+    with ThreadPoolExecutor(max_workers=10) as executor:
+        results = list(executor.map(check_project_approvals, projects))
+    
+    # Filter out None results
+    projects_with_approvals = [r for r in results if r is not None]
+    
+    total_approvals = sum(p["total_approvals"] for p in projects_with_approvals)
+    
+    return {
         "group_id": group_id,
         "user_id": target_user_id,
         "timeframe": {
             "created_after": created_after,
             "created_before": created_before
         },
-        "total_approvals": 0,
+        "total_approvals": total_approvals,
         "total_projects_checked": len(projects),
-        "projects_with_approvals": 0,
-        "projects": []
+        "projects_with_approvals": len(projects_with_approvals),
+        "projects": projects_with_approvals
     }
+
+@mcp.tool()
+def get_multiple_users_approvals_across_group(
+    ctx: Context,
+    group_id: str,
+    usernames: List[str],
+    created_after: Optional[str] = None,
+    created_before: Optional[str] = None,
+    state: str = "merged",
+    limit_per_project: int = 50
+) -> Dict[str, Any]:
+    """
+    Get merge requests approved by multiple users across all projects in a GitLab group.
+    This function processes multiple users in parallel for maximum efficiency.
     
-    for project in projects:
-        project_id = str(project["id"])
-        project_path = project["path_with_namespace"]
-        
+    Args:
+        group_id: The GitLab group ID or path
+        usernames: List of GitLab usernames to query
+        created_after: ISO 8601 formatted date (YYYY-MM-DD or YYYY-MM-DDTHH:MM:SSZ)
+        created_before: ISO 8601 formatted date (YYYY-MM-DD or YYYY-MM-DDTHH:MM:SSZ)
+        state: Filter merge requests by state (all, opened, closed, merged, or locked)
+        limit_per_project: Maximum number of merge requests to check per project
+    Returns:
+        Dict containing approved merge requests for all users across the group
+    """
+    import concurrent.futures
+    from concurrent.futures import ThreadPoolExecutor
+    
+    def get_user_data(username):
         try:
-            # Get approvals for this project
-            project_approvals = get_user_approved_merge_requests(
-                ctx=ctx,
-                project_id=project_id,
-                user_id=target_user_id,
-                created_after=created_after,
-                created_before=created_before,
-                state=state,
-                limit=limit_per_project
+            result = get_user_approvals_across_group(
+                ctx, group_id, None, username, created_after, created_before, state, limit_per_project
             )
-            
-            if project_approvals["statistics"]["total_approved"] > 0:
-                project_summary = {
-                    "project_id": project_id,
-                    "project_name": project["name"],
-                    "project_path": project_path,
-                    "project_web_url": project["web_url"],
-                    "total_approvals": project_approvals["statistics"]["total_approved"],
-                    "approved_mrs": [
-                        {
-                            "iid": mr["merge_request"]["iid"],
-                            "title": mr["merge_request"]["title"],
-                            "approved_at": mr["approved_at"],
-                            "web_url": mr["merge_request"]["web_url"]
-                        }
-                        for mr in project_approvals["approved_merge_requests"]
-                    ]
-                }
-                
-                group_summary["projects"].append(project_summary)
-                group_summary["total_approvals"] += project_approvals["statistics"]["total_approved"]
-                group_summary["projects_with_approvals"] += 1
-                
+            return {
+                "username": username,
+                "success": True,
+                "data": result
+            }
         except Exception as e:
-            logger.warning(f"Could not fetch approvals for project {project_path}: {str(e)}")
-            continue
+            return {
+                "username": username,
+                "success": False,
+                "error": str(e),
+                "data": None
+            }
     
-    # Sort projects by total approvals
-    group_summary["projects"].sort(key=lambda x: x["total_approvals"], reverse=True)
+    # Process all users in parallel
+    with ThreadPoolExecutor(max_workers=len(usernames)) as executor:
+        user_results = list(executor.map(get_user_data, usernames))
     
-    return group_summary
+    # Aggregate results
+    successful_users = [r for r in user_results if r["success"]]
+    failed_users = [r for r in user_results if not r["success"]]
+    
+    total_approvals_all_users = sum(user["data"]["total_approvals"] for user in successful_users)
+    
+    # Create summary statistics
+    user_summary = []
+    for user_result in successful_users:
+        user_data = user_result["data"]
+        user_summary.append({
+            "username": user_result["username"],
+            "user_id": user_data["user_id"],
+            "total_approvals": user_data["total_approvals"],
+            "projects_with_approvals": user_data["projects_with_approvals"],
+            "projects_checked": user_data["total_projects_checked"]
+        })
+    
+    return {
+        "group_id": group_id,
+        "timeframe": {
+            "created_after": created_after,
+            "created_before": created_before
+        },
+        "query_summary": {
+            "total_users_queried": len(usernames),
+            "successful_queries": len(successful_users),
+            "failed_queries": len(failed_users),
+            "total_approvals_all_users": total_approvals_all_users
+        },
+        "user_summary": user_summary,
+        "detailed_results": [user["data"] for user in successful_users],
+        "failed_queries": failed_users
+    }
+
+@mcp.tool()
+def get_multiple_users_approvals_across_groups(
+    ctx: Context,
+    group_ids: List[str],
+    usernames: List[str],
+    created_after: Optional[str] = None,
+    created_before: Optional[str] = None,
+    state: str = "merged",
+    limit_per_project: int = 50
+) -> Dict[str, Any]:
+    """
+    Get merge requests approved by multiple users across multiple GitLab groups.
+    This function processes multiple users and groups in parallel for maximum efficiency.
+    
+    Args:
+        group_ids: List of GitLab group IDs or paths
+        usernames: List of GitLab usernames to query
+        created_after: ISO 8601 formatted date (YYYY-MM-DD or YYYY-MM-DDTHH:MM:SSZ)
+        created_before: ISO 8601 formatted date (YYYY-MM-DD or YYYY-MM-DDTHH:MM:SSZ)
+        state: Filter merge requests by state (all, opened, closed, merged, or locked)
+        limit_per_project: Maximum number of merge requests to check per project
+    Returns:
+        Dict containing approved merge requests for all users across all groups
+    """
+    import concurrent.futures
+    from concurrent.futures import ThreadPoolExecutor
+    
+    def get_group_user_data(group_user_combo):
+        group_id, username = group_user_combo
+        try:
+            result = get_user_approvals_across_group(
+                ctx, group_id, None, username, created_after, created_before, state, limit_per_project
+            )
+            return {
+                "group_id": group_id,
+                "username": username,
+                "success": True,
+                "data": result
+            }
+        except Exception as e:
+            return {
+                "group_id": group_id,
+                "username": username,
+                "success": False,
+                "error": str(e),
+                "data": None
+            }
+    
+    # Create all combinations of groups and users
+    group_user_combinations = [(group_id, username) for group_id in group_ids for username in usernames]
+    
+    # Process all combinations in parallel
+    with ThreadPoolExecutor(max_workers=min(20, len(group_user_combinations))) as executor:
+        results = list(executor.map(get_group_user_data, group_user_combinations))
+    
+    # Aggregate results
+    successful_results = [r for r in results if r["success"]]
+    failed_results = [r for r in results if not r["success"]]
+    
+    # Organize data by user and group
+    user_totals = {}
+    group_totals = {}
+    group_user_matrix = {}
+    
+    for result in successful_results:
+        username = result["username"]
+        group_id = result["group_id"]
+        approvals = result["data"]["total_approvals"]
+        
+        # User totals
+        if username not in user_totals:
+            user_totals[username] = {"total_approvals": 0, "groups": {}}
+        user_totals[username]["total_approvals"] += approvals
+        user_totals[username]["groups"][group_id] = approvals
+        
+        # Group totals
+        if group_id not in group_totals:
+            group_totals[group_id] = {"total_approvals": 0, "users": {}}
+        group_totals[group_id]["total_approvals"] += approvals
+        group_totals[group_id]["users"][username] = approvals
+        
+        # Matrix for detailed view
+        if group_id not in group_user_matrix:
+            group_user_matrix[group_id] = {}
+        group_user_matrix[group_id][username] = result["data"]
+    
+    grand_total = sum(user_data["total_approvals"] for user_data in user_totals.values())
+    
+    return {
+        "timeframe": {
+            "created_after": created_after,
+            "created_before": created_before
+        },
+        "query_summary": {
+            "total_groups": len(group_ids),
+            "total_users": len(usernames),
+            "total_combinations_queried": len(group_user_combinations),
+            "successful_queries": len(successful_results),
+            "failed_queries": len(failed_results),
+            "grand_total_approvals": grand_total
+        },
+        "user_totals": user_totals,
+        "group_totals": group_totals,
+        "detailed_matrix": group_user_matrix,
+        "failed_queries": failed_results
+    }
+
+@mcp.tool()
+def get_bulk_approval_leaderboard(
+    ctx: Context,
+    group_ids: List[str],
+    usernames: List[str],
+    created_after: Optional[str] = None,
+    created_before: Optional[str] = None,
+    state: str = "merged"
+) -> Dict[str, Any]:
+    """
+    Get a ranked leaderboard of user approvals across multiple groups.
+    Optimized for performance with parallel processing.
+    
+    Args:
+        group_ids: List of GitLab group IDs or paths
+        usernames: List of GitLab usernames to query
+        created_after: ISO 8601 formatted date (YYYY-MM-DD or YYYY-MM-DDTHH:MM:SSZ)
+        created_before: ISO 8601 formatted date (YYYY-MM-DD or YYYY-MM-DDTHH:MM:SSZ)
+        state: Filter merge requests by state (all, opened, closed, merged, or locked)
+    Returns:
+        Dict containing ranked leaderboard and statistics
+    """
+    # Get the full data using the batch function
+    full_results = get_multiple_users_approvals_across_groups(
+        ctx, group_ids, usernames, created_after, created_before, state, 30
+    )
+    
+    # Create leaderboard from user totals
+    leaderboard = []
+    for username, user_data in full_results["user_totals"].items():
+        leaderboard_entry = {
+            "username": username,
+            "total_approvals": user_data["total_approvals"],
+            "group_breakdown": user_data["groups"]
+        }
+        leaderboard.append(leaderboard_entry)
+    
+    # Sort by total approvals (descending)
+    leaderboard.sort(key=lambda x: x["total_approvals"], reverse=True)
+    
+    # Add ranking
+    for i, entry in enumerate(leaderboard, 1):
+        entry["rank"] = i
+    
+    # Group statistics
+    group_stats = []
+    for group_id, group_data in full_results["group_totals"].items():
+        group_stats.append({
+            "group_id": group_id,
+            "total_approvals": group_data["total_approvals"],
+            "active_users": len([u for u, approvals in group_data["users"].items() if approvals > 0]),
+            "top_user": max(group_data["users"].items(), key=lambda x: x[1]) if group_data["users"] else None
+        })
+    
+    return {
+        "timeframe": full_results["timeframe"],
+        "query_summary": full_results["query_summary"],
+        "leaderboard": leaderboard,
+        "group_statistics": group_stats,
+        "performance_metrics": {
+            "total_api_calls_saved": f"Saved ~{len(group_ids) * len(usernames) * 10} individual API calls",
+            "parallel_efficiency": f"Processed {len(usernames)} users × {len(group_ids)} groups in parallel"
+        }
+    }
 
 if __name__ == "__main__":
     try:
