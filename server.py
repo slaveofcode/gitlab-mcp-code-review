@@ -386,6 +386,822 @@ def get_project_merge_requests(ctx: Context, project_id: str, state: str = "all"
     
     return mrs_info
 
+@mcp.tool()
+def get_user_approved_merge_requests(
+    ctx: Context, 
+    project_id: str, 
+    user_id: Optional[str] = None,
+    username: Optional[str] = None,
+    created_after: Optional[str] = None,
+    created_before: Optional[str] = None,
+    state: str = "merged",
+    limit: int = 100
+) -> Dict[str, Any]:
+    """
+    Get merge requests approved by a specific user within a timeframe.
+    
+    Args:
+        project_id: The GitLab project ID or URL-encoded path
+        user_id: The GitLab user ID (either user_id or username must be provided)
+        username: The GitLab username (either user_id or username must be provided)
+        created_after: ISO 8601 formatted date (YYYY-MM-DD or YYYY-MM-DDTHH:MM:SSZ)
+        created_before: ISO 8601 formatted date (YYYY-MM-DD or YYYY-MM-DDTHH:MM:SSZ)
+        state: Filter merge requests by state (all, opened, closed, merged, or locked)
+        limit: Maximum number of merge requests to return
+    Returns:
+        Dict containing approved merge requests and statistics
+    """
+    # First, get the user info if username is provided instead of user_id
+    target_user_id = user_id
+    if not target_user_id and username:
+        users_endpoint = f"users?username={quote(username, safe='')}"
+        users_info = make_gitlab_api_request(ctx, users_endpoint)
+        if not users_info:
+            raise ValueError(f"User '{username}' not found")
+        target_user_id = str(users_info[0]["id"])
+    
+    if not target_user_id:
+        raise ValueError("Either user_id or username must be provided")
+    
+    # Build the query parameters
+    params = [
+        f"state={state}",
+        f"per_page={limit}",
+        "sort=desc",
+        "order_by=created_at"
+    ]
+    
+    if created_after:
+        params.append(f"created_after={quote(created_after, safe='')}")
+    if created_before:
+        params.append(f"created_before={quote(created_before, safe='')}")
+    
+    # Get merge requests
+    mrs_endpoint = f"projects/{quote(project_id, safe='')}/merge_requests?{'&'.join(params)}"
+    mrs_info = make_gitlab_api_request(ctx, mrs_endpoint)
+    
+    approved_mrs = []
+    total_approved = 0
+    
+    for mr in mrs_info:
+        # Get approval information for each MR
+        approval_endpoint = f"projects/{quote(project_id, safe='')}/merge_requests/{mr['iid']}/approvals"
+        try:
+            approval_info = make_gitlab_api_request(ctx, approval_endpoint)
+            
+            # Check if the user approved this MR
+            approved_by_users = approval_info.get("approved_by", [])
+            user_approved = any(
+                str(approver.get("user", {}).get("id")) == target_user_id 
+                for approver in approved_by_users
+            )
+            
+            if user_approved:
+                # Find the specific approval by this user
+                user_approval = next(
+                    (approver for approver in approved_by_users 
+                     if str(approver.get("user", {}).get("id")) == target_user_id),
+                    None
+                )
+                
+                mr_data = {
+                    "merge_request": mr,
+                    "approval_info": approval_info,
+                    "user_approval": user_approval,
+                    "approved_at": user_approval.get("created_at") if user_approval else None
+                }
+                approved_mrs.append(mr_data)
+                total_approved += 1
+                
+        except Exception as e:
+            logger.warning(f"Could not fetch approval info for MR {mr['iid']}: {str(e)}")
+            continue
+    
+    return {
+        "project_id": project_id,
+        "user_id": target_user_id,
+        "timeframe": {
+            "created_after": created_after,
+            "created_before": created_before
+        },
+        "statistics": {
+            "total_approved": total_approved,
+            "total_mrs_checked": len(mrs_info)
+        },
+        "approved_merge_requests": approved_mrs
+    }
+
+@mcp.tool()
+def get_project_approval_statistics(
+    ctx: Context,
+    project_id: str,
+    created_after: Optional[str] = None,
+    created_before: Optional[str] = None,
+    state: str = "merged",
+    limit: int = 200
+) -> Dict[str, Any]:
+    """
+    Get aggregated approval statistics for a project within a timeframe.
+    
+    Args:
+        project_id: The GitLab project ID or URL-encoded path
+        created_after: ISO 8601 formatted date (YYYY-MM-DD or YYYY-MM-DDTHH:MM:SSZ)
+        created_before: ISO 8601 formatted date (YYYY-MM-DD or YYYY-MM-DDTHH:MM:SSZ)
+        state: Filter merge requests by state (all, opened, closed, merged, or locked)
+        limit: Maximum number of merge requests to analyze
+    Returns:
+        Dict containing approval statistics aggregated by user
+    """
+    # Build the query parameters
+    params = [
+        f"state={state}",
+        f"per_page={limit}",
+        "sort=desc",
+        "order_by=created_at"
+    ]
+    
+    if created_after:
+        params.append(f"created_after={quote(created_after, safe='')}")
+    if created_before:
+        params.append(f"created_before={quote(created_before, safe='')}")
+    
+    # Get merge requests
+    mrs_endpoint = f"projects/{quote(project_id, safe='')}/merge_requests?{'&'.join(params)}"
+    mrs_info = make_gitlab_api_request(ctx, mrs_endpoint)
+    
+    user_stats = {}
+    total_mrs = len(mrs_info)
+    total_approvals = 0
+    
+    for mr in mrs_info:
+        # Get approval information for each MR
+        approval_endpoint = f"projects/{quote(project_id, safe='')}/merge_requests/{mr['iid']}/approvals"
+        try:
+            approval_info = make_gitlab_api_request(ctx, approval_endpoint)
+            approved_by_users = approval_info.get("approved_by", [])
+            
+            for approver in approved_by_users:
+                user_info = approver.get("user", {})
+                user_id = str(user_info.get("id", "unknown"))
+                username = user_info.get("username", "unknown")
+                name = user_info.get("name", "unknown")
+                
+                if user_id not in user_stats:
+                    user_stats[user_id] = {
+                        "user_id": user_id,
+                        "username": username,
+                        "name": name,
+                        "total_approvals": 0,
+                        "approved_mrs": []
+                    }
+                
+                user_stats[user_id]["total_approvals"] += 1
+                user_stats[user_id]["approved_mrs"].append({
+                    "mr_iid": mr["iid"],
+                    "mr_title": mr["title"],
+                    "approved_at": approver.get("created_at"),
+                    "mr_created_at": mr["created_at"],
+                    "mr_web_url": mr["web_url"]
+                })
+                total_approvals += 1
+                
+        except Exception as e:
+            logger.warning(f"Could not fetch approval info for MR {mr['iid']}: {str(e)}")
+            continue
+    
+    # Sort users by total approvals
+    sorted_users = sorted(user_stats.values(), key=lambda x: x["total_approvals"], reverse=True)
+    
+    return {
+        "project_id": project_id,
+        "timeframe": {
+            "created_after": created_after,
+            "created_before": created_before
+        },
+        "statistics": {
+            "total_merge_requests": total_mrs,
+            "total_approvals": total_approvals,
+            "unique_approvers": len(user_stats),
+            "average_approvals_per_mr": round(total_approvals / total_mrs, 2) if total_mrs > 0 else 0
+        },
+        "users": sorted_users
+    }
+
+@mcp.tool()
+def get_user_approval_summary(
+    ctx: Context,
+    user_id: Optional[str] = None,
+    username: Optional[str] = None,
+    project_ids: Optional[List[str]] = None,
+    created_after: Optional[str] = None,
+    created_before: Optional[str] = None,
+    state: str = "merged"
+) -> Dict[str, Any]:
+    """
+    Get a comprehensive approval summary for a user across multiple projects.
+    
+    Args:
+        user_id: The GitLab user ID (either user_id or username must be provided)
+        username: The GitLab username (either user_id or username must be provided)
+        project_ids: List of project IDs to analyze (if None, gets user's accessible projects)
+        created_after: ISO 8601 formatted date (YYYY-MM-DD or YYYY-MM-DDTHH:MM:SSZ)
+        created_before: ISO 8601 formatted date (YYYY-MM-DD or YYYY-MM-DDTHH:MM:SSZ)
+        state: Filter merge requests by state (all, opened, closed, merged, or locked)
+    Returns:
+        Dict containing comprehensive approval summary across projects
+    """
+    # First, get the user info if username is provided instead of user_id
+    target_user_id = user_id
+    user_info = None
+    
+    if not target_user_id and username:
+        users_endpoint = f"users?username={quote(username, safe='')}"
+        users_data = make_gitlab_api_request(ctx, users_endpoint)
+        if not users_data:
+            raise ValueError(f"User '{username}' not found")
+        user_info = users_data[0]
+        target_user_id = str(user_info["id"])
+    elif target_user_id:
+        users_endpoint = f"users/{target_user_id}"
+        user_info = make_gitlab_api_request(ctx, users_endpoint)
+    
+    if not target_user_id:
+        raise ValueError("Either user_id or username must be provided")
+    
+    # If no project_ids provided, get user's accessible projects
+    if not project_ids:
+        projects_endpoint = f"users/{target_user_id}/projects?per_page=50"
+        try:
+            projects_data = make_gitlab_api_request(ctx, projects_endpoint)
+            project_ids = [str(project["id"]) for project in projects_data]
+        except Exception as e:
+            logger.warning(f"Could not fetch user projects: {str(e)}")
+            project_ids = []
+    
+    summary = {
+        "user": {
+            "id": target_user_id,
+            "username": user_info.get("username") if user_info else username,
+            "name": user_info.get("name") if user_info else "Unknown"
+        },
+        "timeframe": {
+            "created_after": created_after,
+            "created_before": created_before
+        },
+        "total_approvals": 0,
+        "projects": []
+    }
+    
+    for project_id in project_ids:
+        try:
+            # Get approvals for this project
+            project_approvals = get_user_approved_merge_requests(
+                ctx=ctx,
+                project_id=project_id,
+                user_id=target_user_id,
+                created_after=created_after,
+                created_before=created_before,
+                state=state,
+                limit=100
+            )
+            
+            if project_approvals["statistics"]["total_approved"] > 0:
+                # Get project info
+                project_endpoint = f"projects/{quote(project_id, safe='')}"
+                project_info = make_gitlab_api_request(ctx, project_endpoint)
+                
+                project_summary = {
+                    "project_id": project_id,
+                    "project_name": project_info.get("name", "Unknown"),
+                    "project_path": project_info.get("path_with_namespace", "Unknown"),
+                    "total_approvals": project_approvals["statistics"]["total_approved"],
+                    "approved_mrs": [
+                        {
+                            "iid": mr["merge_request"]["iid"],
+                            "title": mr["merge_request"]["title"],
+                            "approved_at": mr["approved_at"],
+                            "web_url": mr["merge_request"]["web_url"]
+                        }
+                        for mr in project_approvals["approved_merge_requests"]
+                    ]
+                }
+                
+                summary["projects"].append(project_summary)
+                summary["total_approvals"] += project_approvals["statistics"]["total_approved"]
+                
+        except Exception as e:
+            logger.warning(f"Could not fetch approvals for project {project_id}: {str(e)}")
+            continue
+    
+    # Sort projects by total approvals
+    summary["projects"].sort(key=lambda x: x["total_approvals"], reverse=True)
+    
+    return summary
+
+@mcp.tool()
+def get_monthly_approval_trends(
+    ctx: Context,
+    project_id: str,
+    user_id: Optional[str] = None,
+    username: Optional[str] = None,
+    months_back: int = 6
+) -> Dict[str, Any]:
+    """
+    Get monthly approval trends for a project or specific user.
+    
+    Args:
+        project_id: The GitLab project ID or URL-encoded path
+        user_id: Optional user ID to focus on specific user trends
+        username: Optional username to focus on specific user trends
+        months_back: Number of months to look back from current date
+    Returns:
+        Dict containing monthly approval trends and statistics
+    """
+    from datetime import datetime, timedelta
+    import calendar
+    
+    # Calculate date range
+    end_date = datetime.now()
+    start_date = end_date - timedelta(days=months_back * 30)  # Approximate months
+    
+    # Get user ID if username provided
+    target_user_id = user_id
+    if not target_user_id and username:
+        users_endpoint = f"users?username={quote(username, safe='')}"
+        users_info = make_gitlab_api_request(ctx, users_endpoint)
+        if not users_info:
+            raise ValueError(f"User '{username}' not found")
+        target_user_id = str(users_info[0]["id"])
+    
+    # Generate monthly buckets
+    monthly_stats = {}
+    current_date = start_date.replace(day=1)  # Start from first day of month
+    
+    while current_date <= end_date:
+        month_key = current_date.strftime("%Y-%m")
+        monthly_stats[month_key] = {
+            "month": current_date.strftime("%B %Y"),
+            "total_approvals": 0,
+            "unique_approvers": set(),
+            "approved_mrs": []
+        }
+        
+        # Move to next month
+        if current_date.month == 12:
+            current_date = current_date.replace(year=current_date.year + 1, month=1)
+        else:
+            current_date = current_date.replace(month=current_date.month + 1)
+    
+    # Get all merge requests in the timeframe
+    created_after = start_date.strftime("%Y-%m-%dT00:00:00Z")
+    created_before = end_date.strftime("%Y-%m-%dT23:59:59Z")
+    
+    if target_user_id:
+        # Get approvals for specific user
+        approval_data = get_user_approved_merge_requests(
+            ctx=ctx,
+            project_id=project_id,
+            user_id=target_user_id,
+            created_after=created_after,
+            created_before=created_before,
+            limit=500
+        )
+        
+        for mr_data in approval_data["approved_merge_requests"]:
+            approved_at = mr_data.get("approved_at")
+            if approved_at:
+                approved_date = datetime.fromisoformat(approved_at.replace('Z', '+00:00'))
+                month_key = approved_date.strftime("%Y-%m")
+                
+                if month_key in monthly_stats:
+                    monthly_stats[month_key]["total_approvals"] += 1
+                    monthly_stats[month_key]["approved_mrs"].append({
+                        "iid": mr_data["merge_request"]["iid"],
+                        "title": mr_data["merge_request"]["title"],
+                        "approved_at": approved_at
+                    })
+    else:
+        # Get project-wide approval statistics
+        project_stats = get_project_approval_statistics(
+            ctx=ctx,
+            project_id=project_id,
+            created_after=created_after,
+            created_before=created_before,
+            limit=500
+        )
+        
+        for user_data in project_stats["users"]:
+            for mr in user_data["approved_mrs"]:
+                approved_at = mr.get("approved_at")
+                if approved_at:
+                    approved_date = datetime.fromisoformat(approved_at.replace('Z', '+00:00'))
+                    month_key = approved_date.strftime("%Y-%m")
+                    
+                    if month_key in monthly_stats:
+                        monthly_stats[month_key]["total_approvals"] += 1
+                        monthly_stats[month_key]["unique_approvers"].add(user_data["user_id"])
+                        monthly_stats[month_key]["approved_mrs"].append({
+                            "iid": mr["mr_iid"],
+                            "title": mr["mr_title"],
+                            "approved_at": approved_at,
+                            "approver": user_data["username"]
+                        })
+    
+    # Convert sets to counts and format results
+    formatted_stats = []
+    for month_key in sorted(monthly_stats.keys()):
+        stats = monthly_stats[month_key]
+        formatted_stats.append({
+            "month": stats["month"],
+            "month_key": month_key,
+            "total_approvals": stats["total_approvals"],
+            "unique_approvers": len(stats["unique_approvers"]) if not target_user_id else None,
+            "approved_mrs": stats["approved_mrs"]
+        })
+    
+    return {
+        "project_id": project_id,
+        "user_id": target_user_id,
+        "timeframe": {
+            "start_date": created_after,
+            "end_date": created_before,
+            "months_analyzed": len(formatted_stats)
+        },
+        "monthly_trends": formatted_stats,
+        "summary": {
+            "total_approvals": sum(month["total_approvals"] for month in formatted_stats),
+            "average_monthly_approvals": round(
+                sum(month["total_approvals"] for month in formatted_stats) / len(formatted_stats), 2
+            ) if formatted_stats else 0
+        }
+    }
+
+@mcp.tool()
+def get_group_projects(ctx: Context, group_id: str, per_page: int = 100) -> List[Dict[str, Any]]:
+    """
+    Get all projects within a GitLab group.
+    
+    Args:
+        group_id: The GitLab group ID or path
+        per_page: Number of projects to return per page (max 100)
+    Returns:
+        List of project objects in the group
+    """
+    # Get projects in the group
+    projects_endpoint = f"groups/{quote(group_id, safe='')}/projects?per_page={per_page}&include_subgroups=true"
+    projects_info = make_gitlab_api_request(ctx, projects_endpoint)
+    
+    return projects_info
+
+@mcp.tool()
+def get_user_approvals_across_group(
+    ctx: Context,
+    group_id: str,
+    user_id: Optional[str] = None,
+    username: Optional[str] = None,
+    created_after: Optional[str] = None,
+    created_before: Optional[str] = None,
+    state: str = "merged",
+    limit_per_project: int = 50
+) -> Dict[str, Any]:
+    """
+    Get merge requests approved by a specific user across all projects in a GitLab group.
+    
+    Args:
+        group_id: The GitLab group ID or path
+        user_id: The GitLab user ID (either user_id or username must be provided)
+        username: The GitLab username (either user_id or username must be provided)
+        created_after: ISO 8601 formatted date (YYYY-MM-DD or YYYY-MM-DDTHH:MM:SSZ)
+        created_before: ISO 8601 formatted date (YYYY-MM-DD or YYYY-MM-DDTHH:MM:SSZ)
+        state: Filter merge requests by state (all, opened, closed, merged, or locked)
+        limit_per_project: Maximum number of merge requests to check per project
+    Returns:
+        Dict containing approved merge requests across all projects in the group
+    """
+    import concurrent.futures
+    from concurrent.futures import ThreadPoolExecutor
+    
+    # First, get the user info if username is provided instead of user_id
+    target_user_id = user_id
+    if not target_user_id and username:
+        users_endpoint = f"users?username={quote(username, safe='')}"
+        users_info = make_gitlab_api_request(ctx, users_endpoint)
+        if not users_info:
+            raise ValueError(f"User '{username}' not found")
+        target_user_id = str(users_info[0]["id"])
+    
+    if not target_user_id:
+        raise ValueError("Either user_id or username must be provided")
+    
+    # Get all projects in the group
+    projects_endpoint = f"groups/{quote(group_id, safe='')}/projects?per_page=100"
+    projects = make_gitlab_api_request(ctx, projects_endpoint)
+    
+    def check_project_approvals(project):
+        try:
+            result = get_user_approved_merge_requests(
+                ctx, 
+                str(project["id"]), 
+                target_user_id, 
+                None,  # username not needed since we have user_id
+                created_after, 
+                created_before, 
+                state, 
+                limit_per_project
+            )
+            
+            if result["total_approvals"] > 0:
+                return {
+                    "project_id": str(project["id"]),
+                    "project_name": project["name"],
+                    "project_path": project["path_with_namespace"],
+                    "project_web_url": project["web_url"],
+                    "total_approvals": result["total_approvals"],
+                    "approved_mrs": result["approved_merge_requests"]
+                }
+            return None
+        except Exception as e:
+            # Skip projects with errors (e.g., no access)
+            return None
+    
+    # Use ThreadPoolExecutor for parallel processing
+    with ThreadPoolExecutor(max_workers=10) as executor:
+        results = list(executor.map(check_project_approvals, projects))
+    
+    # Filter out None results
+    projects_with_approvals = [r for r in results if r is not None]
+    
+    total_approvals = sum(p["total_approvals"] for p in projects_with_approvals)
+    
+    return {
+        "group_id": group_id,
+        "user_id": target_user_id,
+        "timeframe": {
+            "created_after": created_after,
+            "created_before": created_before
+        },
+        "total_approvals": total_approvals,
+        "total_projects_checked": len(projects),
+        "projects_with_approvals": len(projects_with_approvals),
+        "projects": projects_with_approvals
+    }
+
+@mcp.tool()
+def get_multiple_users_approvals_across_group(
+    ctx: Context,
+    group_id: str,
+    usernames: List[str],
+    created_after: Optional[str] = None,
+    created_before: Optional[str] = None,
+    state: str = "merged",
+    limit_per_project: int = 50
+) -> Dict[str, Any]:
+    """
+    Get merge requests approved by multiple users across all projects in a GitLab group.
+    This function processes multiple users in parallel for maximum efficiency.
+    
+    Args:
+        group_id: The GitLab group ID or path
+        usernames: List of GitLab usernames to query
+        created_after: ISO 8601 formatted date (YYYY-MM-DD or YYYY-MM-DDTHH:MM:SSZ)
+        created_before: ISO 8601 formatted date (YYYY-MM-DD or YYYY-MM-DDTHH:MM:SSZ)
+        state: Filter merge requests by state (all, opened, closed, merged, or locked)
+        limit_per_project: Maximum number of merge requests to check per project
+    Returns:
+        Dict containing approved merge requests for all users across the group
+    """
+    import concurrent.futures
+    from concurrent.futures import ThreadPoolExecutor
+    
+    def get_user_data(username):
+        try:
+            result = get_user_approvals_across_group(
+                ctx, group_id, None, username, created_after, created_before, state, limit_per_project
+            )
+            return {
+                "username": username,
+                "success": True,
+                "data": result
+            }
+        except Exception as e:
+            return {
+                "username": username,
+                "success": False,
+                "error": str(e),
+                "data": None
+            }
+    
+    # Process all users in parallel
+    with ThreadPoolExecutor(max_workers=len(usernames)) as executor:
+        user_results = list(executor.map(get_user_data, usernames))
+    
+    # Aggregate results
+    successful_users = [r for r in user_results if r["success"]]
+    failed_users = [r for r in user_results if not r["success"]]
+    
+    total_approvals_all_users = sum(user["data"]["total_approvals"] for user in successful_users)
+    
+    # Create summary statistics
+    user_summary = []
+    for user_result in successful_users:
+        user_data = user_result["data"]
+        user_summary.append({
+            "username": user_result["username"],
+            "user_id": user_data["user_id"],
+            "total_approvals": user_data["total_approvals"],
+            "projects_with_approvals": user_data["projects_with_approvals"],
+            "projects_checked": user_data["total_projects_checked"]
+        })
+    
+    return {
+        "group_id": group_id,
+        "timeframe": {
+            "created_after": created_after,
+            "created_before": created_before
+        },
+        "query_summary": {
+            "total_users_queried": len(usernames),
+            "successful_queries": len(successful_users),
+            "failed_queries": len(failed_users),
+            "total_approvals_all_users": total_approvals_all_users
+        },
+        "user_summary": user_summary,
+        "detailed_results": [user["data"] for user in successful_users],
+        "failed_queries": failed_users
+    }
+
+@mcp.tool()
+def get_multiple_users_approvals_across_groups(
+    ctx: Context,
+    group_ids: List[str],
+    usernames: List[str],
+    created_after: Optional[str] = None,
+    created_before: Optional[str] = None,
+    state: str = "merged",
+    limit_per_project: int = 50
+) -> Dict[str, Any]:
+    """
+    Get merge requests approved by multiple users across multiple GitLab groups.
+    This function processes multiple users and groups in parallel for maximum efficiency.
+    
+    Args:
+        group_ids: List of GitLab group IDs or paths
+        usernames: List of GitLab usernames to query
+        created_after: ISO 8601 formatted date (YYYY-MM-DD or YYYY-MM-DDTHH:MM:SSZ)
+        created_before: ISO 8601 formatted date (YYYY-MM-DD or YYYY-MM-DDTHH:MM:SSZ)
+        state: Filter merge requests by state (all, opened, closed, merged, or locked)
+        limit_per_project: Maximum number of merge requests to check per project
+    Returns:
+        Dict containing approved merge requests for all users across all groups
+    """
+    import concurrent.futures
+    from concurrent.futures import ThreadPoolExecutor
+    
+    def get_group_user_data(group_user_combo):
+        group_id, username = group_user_combo
+        try:
+            result = get_user_approvals_across_group(
+                ctx, group_id, None, username, created_after, created_before, state, limit_per_project
+            )
+            return {
+                "group_id": group_id,
+                "username": username,
+                "success": True,
+                "data": result
+            }
+        except Exception as e:
+            return {
+                "group_id": group_id,
+                "username": username,
+                "success": False,
+                "error": str(e),
+                "data": None
+            }
+    
+    # Create all combinations of groups and users
+    group_user_combinations = [(group_id, username) for group_id in group_ids for username in usernames]
+    
+    # Process all combinations in parallel
+    with ThreadPoolExecutor(max_workers=min(20, len(group_user_combinations))) as executor:
+        results = list(executor.map(get_group_user_data, group_user_combinations))
+    
+    # Aggregate results
+    successful_results = [r for r in results if r["success"]]
+    failed_results = [r for r in results if not r["success"]]
+    
+    # Organize data by user and group
+    user_totals = {}
+    group_totals = {}
+    group_user_matrix = {}
+    
+    for result in successful_results:
+        username = result["username"]
+        group_id = result["group_id"]
+        approvals = result["data"]["total_approvals"]
+        
+        # User totals
+        if username not in user_totals:
+            user_totals[username] = {"total_approvals": 0, "groups": {}}
+        user_totals[username]["total_approvals"] += approvals
+        user_totals[username]["groups"][group_id] = approvals
+        
+        # Group totals
+        if group_id not in group_totals:
+            group_totals[group_id] = {"total_approvals": 0, "users": {}}
+        group_totals[group_id]["total_approvals"] += approvals
+        group_totals[group_id]["users"][username] = approvals
+        
+        # Matrix for detailed view
+        if group_id not in group_user_matrix:
+            group_user_matrix[group_id] = {}
+        group_user_matrix[group_id][username] = result["data"]
+    
+    grand_total = sum(user_data["total_approvals"] for user_data in user_totals.values())
+    
+    return {
+        "timeframe": {
+            "created_after": created_after,
+            "created_before": created_before
+        },
+        "query_summary": {
+            "total_groups": len(group_ids),
+            "total_users": len(usernames),
+            "total_combinations_queried": len(group_user_combinations),
+            "successful_queries": len(successful_results),
+            "failed_queries": len(failed_results),
+            "grand_total_approvals": grand_total
+        },
+        "user_totals": user_totals,
+        "group_totals": group_totals,
+        "detailed_matrix": group_user_matrix,
+        "failed_queries": failed_results
+    }
+
+@mcp.tool()
+def get_bulk_approval_leaderboard(
+    ctx: Context,
+    group_ids: List[str],
+    usernames: List[str],
+    created_after: Optional[str] = None,
+    created_before: Optional[str] = None,
+    state: str = "merged"
+) -> Dict[str, Any]:
+    """
+    Get a ranked leaderboard of user approvals across multiple groups.
+    Optimized for performance with parallel processing.
+    
+    Args:
+        group_ids: List of GitLab group IDs or paths
+        usernames: List of GitLab usernames to query
+        created_after: ISO 8601 formatted date (YYYY-MM-DD or YYYY-MM-DDTHH:MM:SSZ)
+        created_before: ISO 8601 formatted date (YYYY-MM-DD or YYYY-MM-DDTHH:MM:SSZ)
+        state: Filter merge requests by state (all, opened, closed, merged, or locked)
+    Returns:
+        Dict containing ranked leaderboard and statistics
+    """
+    # Get the full data using the batch function
+    full_results = get_multiple_users_approvals_across_groups(
+        ctx, group_ids, usernames, created_after, created_before, state, 30
+    )
+    
+    # Create leaderboard from user totals
+    leaderboard = []
+    for username, user_data in full_results["user_totals"].items():
+        leaderboard_entry = {
+            "username": username,
+            "total_approvals": user_data["total_approvals"],
+            "group_breakdown": user_data["groups"]
+        }
+        leaderboard.append(leaderboard_entry)
+    
+    # Sort by total approvals (descending)
+    leaderboard.sort(key=lambda x: x["total_approvals"], reverse=True)
+    
+    # Add ranking
+    for i, entry in enumerate(leaderboard, 1):
+        entry["rank"] = i
+    
+    # Group statistics
+    group_stats = []
+    for group_id, group_data in full_results["group_totals"].items():
+        group_stats.append({
+            "group_id": group_id,
+            "total_approvals": group_data["total_approvals"],
+            "active_users": len([u for u, approvals in group_data["users"].items() if approvals > 0]),
+            "top_user": max(group_data["users"].items(), key=lambda x: x[1]) if group_data["users"] else None
+        })
+    
+    return {
+        "timeframe": full_results["timeframe"],
+        "query_summary": full_results["query_summary"],
+        "leaderboard": leaderboard,
+        "group_statistics": group_stats,
+        "performance_metrics": {
+            "total_api_calls_saved": f"Saved ~{len(group_ids) * len(usernames) * 10} individual API calls",
+            "parallel_efficiency": f"Processed {len(usernames)} users × {len(group_ids)} groups in parallel"
+        }
+    }
+
 if __name__ == "__main__":
     try:
         logger.info("Starting GitLab Review MCP server")

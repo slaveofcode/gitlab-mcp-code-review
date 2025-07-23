@@ -1,19 +1,51 @@
 {
   "mcpServers": {
-    "gitlab-review-mcp": {
-      "command": "${WORKSPACE_PATH}/.venv/bin/python",
+    "gitlab-mcp-code-review": {
+      "command": "/path/to/your/gitlab-mcp-code-review/.venv/bin/python",
       "args": [
-        "${WORKSPACE_PATH}/server.py",
         "--transport",
-        "stdio"
+        "stdio",
+        "/path/to/your/gitlab-mcp-code-review/server.py"
       ],
-      "cwd": "${WORKSPACE_PATH}",
+      "stdio": true,
+      "cwd": "/path/to/your/gitlab-mcp-code-review",
       "env": {
-        "PYTHONPATH": "${WORKSPACE_PATH}",
-        "VIRTUAL_ENV": "${WORKSPACE_PATH}/.venv",
-        "PATH": "${WORKSPACE_PATH}/.venv/bin:/usr/local/bin:/usr/bin:/bin"
-      },
-      "stdio": true
+        "PYTHONPATH": "/path/to/your/gitlab-mcp-code-review",
+        "VIRTUAL_ENV": "/path/to/your/gitlab-mcp-code-review/.venv",
+        "PATH": "/path/to/your/gitlab-mcp-code-review/.venv/bin:/usr/local/bin:/usr/bin:/bin"
+      }
+    }
+  },
+  "examples": {
+    "basic_operations": {
+      "description": "Core GitLab MR operations",
+      "test_connection": "test_gitlab_connection()",
+      "fetch_mr": "fetch_merge_request('project-id', 'mr-iid')",
+      "get_diff": "fetch_merge_request_diff('project-id', 'mr-iid', 'optional-file-path')",
+      "approve_mr": "approve_merge_request('project-id', 'mr-iid')",
+      "add_comment": "add_merge_request_comment('project-id', 'mr-iid', 'comment-text')"
+    },
+    "approval_analytics": {
+      "description": "New approval analytics capabilities",
+      "user_approvals_timeframe": "get_user_approved_merge_requests(project_id='123', username='john.doe', created_after='2024-01-01', created_before='2024-01-31')",
+      "project_statistics": "get_project_approval_statistics(project_id='123', created_after='2024-01-01', created_before='2024-03-31')",
+      "user_summary_multi_project": "get_user_approval_summary(username='jane.smith', project_ids=['123', '456'], created_after='2024-01-01')",
+      "monthly_trends_project": "get_monthly_approval_trends(project_id='123', months_back=6)",
+      "monthly_trends_user": "get_monthly_approval_trends(project_id='123', username='john.doe', months_back=12)"
+    },
+    "time_formats": {
+      "description": "Supported date/time formats for analytics",
+      "date_only": "2024-01-15",
+      "datetime_iso": "2024-01-15T09:30:00Z",
+      "datetime_with_timezone": "2024-01-15T09:30:00+02:00"
+    },
+    "use_cases": {
+      "description": "Common use cases for approval analytics",
+      "team_performance": "Track team approval activity and identify top reviewers",
+      "monthly_reports": "Generate monthly approval reports for management",
+      "user_contribution": "Analyze individual contributor review participation",
+      "project_health": "Monitor merge request approval patterns and bottlenecks",
+      "cross_project_analysis": "Compare approval activities across multiple projects"
     }
   }
 } 
